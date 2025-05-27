@@ -20,4 +20,6 @@ kornia==0.6
 openai
 gradio
 seaborn
+fairscale
+timm
 git+https://github.com/crowsonkb/k-diffusion.git
