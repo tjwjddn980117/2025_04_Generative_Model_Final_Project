@@ -1,0 +1,3 @@
+(DiffV2IR_4) C:\Users\Seo\Desktop\Gits\ProjectPractice\DiffV2IR-main>python main.py --base configs/train.yaml --name your_name --train
+
+(DiffV2IR_4) C:\Users\Seo\Desktop\Gits\ProjectPractice\DiffV2IR-main>python infer_weather.py --ckpt my_ckpt.ckpt
