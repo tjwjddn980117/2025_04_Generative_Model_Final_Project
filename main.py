@@ -1,7 +1,7 @@
 import argparse, os, sys, datetime, glob
 import numpy as np
 import time
-import torch
+import torch, gc
 import torchvision
 import pytorch_lightning as pl
 import json
@@ -17,7 +17,7 @@ from PIL import Image
 import torch.distributed as dist
 from pytorch_lightning import seed_everything
 from pytorch_lightning.trainer import Trainer
-from pytorch_lightning.callbacks import ModelCheckpoint, Callback, LearningRateMonitor, TQDMProgressBar, RichProgressBar
+from pytorch_lightning.callbacks import ModelCheckpoint, Callback, LearningRateMonitor
 from pytorch_lightning.utilities import rank_zero_info
 from pytorch_lightning.utilities import rank_zero_only, rank_zero_info
 # from pytorch_lightning.strategies import DDPStrategy
@@ -28,11 +28,75 @@ sys.path.append("./stable_diffusion")
 
 from ldm.data.base import Txt2ImgIterableBaseDataset
 from ldm.util import instantiate_from_config
-
 from tqdm import tqdm
+
+from torch.utils.data.dataloader import default_collate
+
+class NanGuardCallback(Callback):
+    # def on_before_optimizer_step(self, trainer, pl_module, optimizer, optimizer_idx):
+    #     # 2) gradient NaN/Inf 제거
+    #     for p in pl_module.parameters():
+    #         if p.grad is not None:
+    #             # NaN → 0, +inf→1e3, -inf→-1e3
+    #             p.grad.data = torch.nan_to_num(p.grad.data,
+    #                                            nan=0.0,
+    #                                            posinf=1e3,
+    #                                            neginf=-1e3)
+    def on_after_backward(self, trainer, pl_module, *args, **kwargs):
+        for p in pl_module.parameters():
+            if p.grad is not None:
+                p.grad.data = torch.nan_to_num(
+                    p.grad.data,
+                    nan=0.0,
+                    posinf=1e3,
+                    neginf=-1e3
+                )
+
+def collate_impute_zero(batch):
+    """
+    1) default_collate 으로 묶고
+    2) 텐서라면 nan/inf 를 지정 값으로 치환
+    3) 딕셔너리나 리스트/튜플 안도 재귀 처리
+    """
+    batch = default_collate(batch)
+    
+    def _impute(x):
+        if torch.is_tensor(x):
+            # nan → 0, +inf → 1e3, -inf → -1e3 (원하는 값으로 조정)
+            return torch.nan_to_num(x, nan=0.0, posinf=1e3, neginf=-1e3)
+        elif isinstance(x, dict):
+            return {k: _impute(v) for k, v in x.items()}
+        elif isinstance(x, (list, tuple)):
+            return type(x)(_impute(v) for v in x)
+        else:
+            return x
+
+    return _impute(batch)
+
+def _on_before_batch_transfer(self, batch, dataloader_idx: int):
+    # GPU로 옮기기 전에 batch를 half로 통일
+    def to_half(x):
+        return x.half() if isinstance(x, torch.Tensor) else x
+    if isinstance(batch, dict):
+        return {k: to_half(v) for k, v in batch.items()}
+    elif isinstance(batch, (list, tuple)):
+        return type(batch)(to_half(x) for x in batch)
+    else:
+        return to_half(batch)
+
+# LightningModule 서브클래스 전체에 적용
+# pl.LightningModule.on_before_batch_transfer = _on_before_batch_transfer
+
+def _collate_to_half(batch):
+    return 
+    batch = default_collate(batch)
+    return {
+        k: v.half() if isinstance(v, torch.Tensor) else v
+        for k, v in batch.items()
+    }
+
 class TQDMProgressBarCustom(Callback):
     def on_train_epoch_start(self, trainer, pl_module):
-        # 전체 배치 수
         total_batches = len(trainer.train_dataloader)
         self.bar = tqdm(
             total=total_batches,
@@ -40,13 +104,52 @@ class TQDMProgressBarCustom(Callback):
             leave=False
         )
 
-    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
-        # 배치 하나 끝날 때마다 업데이트
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx):
         self.bar.update(1)
 
     def on_train_epoch_end(self, trainer, pl_module):
-        # epoch 끝나면 닫아주기
         self.bar.close()
+
+class DataLoaderTqdmCallback(Callback):
+    def on_train_start(self, trainer, pl_module):
+        # trainer.train_dataloader (단일) vs .train_dataloaders (리스트)
+        if hasattr(trainer, 'train_dataloaders'):
+            orig = trainer.train_dataloaders
+        else:
+            orig = [trainer.train_dataloader]
+        wrapped = [
+            tqdm(dl, desc=f"[Data ▶ Epoch 1/{trainer.max_epochs}]", total=len(dl), leave=False)
+            for dl in orig
+        ]
+        # 다시 할당
+        if hasattr(trainer, 'train_dataloaders'):
+            trainer.train_dataloaders = wrapped
+        else:
+            trainer.train_dataloader = wrapped[0]
+
+    def on_validation_start(self, trainer, pl_module):
+        # validation 쪽도 마찬가지
+        if hasattr(trainer, 'val_dataloaders'):
+            orig = trainer.val_dataloaders
+        else:
+            orig = [trainer.val_dataloader]
+        wrapped = [
+            tqdm(dl, desc="Validation", total=len(dl), leave=False)
+            for dl in orig
+        ]
+        if hasattr(trainer, 'val_dataloaders'):
+            trainer.val_dataloaders = wrapped
+        else:
+            trainer.val_dataloader = wrapped[0]
+
+class ClearCacheCallback(Callback):
+    def on_train_epoch_end(self, trainer, pl_module):
+        torch.cuda.empty_cache()
+        gc.collect()
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        torch.cuda.empty_cache()
+        gc.collect()
 
 def get_parser(**parser_kwargs):
     def str2bool(v):
@@ -232,8 +335,11 @@ class DataModuleFromConfig(pl.LightningDataModule):
         else:
             init_fn = None
         return DataLoader(self.datasets["train"], batch_size=self.batch_size,
+                          num_workers=self.num_workers, shuffle=True,
+                          worker_init_fn=init_fn, persistent_workers=False, collate_fn=collate_impute_zero)
+        return DataLoader(self.datasets["train"], batch_size=self.batch_size,
                           num_workers=self.num_workers, shuffle=False if is_iterable_dataset else True,
-                          worker_init_fn=init_fn, persistent_workers=True)
+                          worker_init_fn=init_fn, persistent_workers=False, collate_fn=collate_impute_zero)
 
     def _val_dataloader(self, shuffle=False):
         if isinstance(self.datasets['validation'], Txt2ImgIterableBaseDataset) or self.use_worker_init_fn:
@@ -244,7 +350,7 @@ class DataModuleFromConfig(pl.LightningDataModule):
                           batch_size=self.batch_size,
                           num_workers=self.num_workers,
                           worker_init_fn=init_fn,
-                          shuffle=shuffle, persistent_workers=True)
+                          shuffle=shuffle, persistent_workers=False, collate_fn=collate_impute_zero)
 
     def _test_dataloader(self, shuffle=False):
         is_iterable_dataset = isinstance(self.datasets['train'], Txt2ImgIterableBaseDataset)
@@ -257,7 +363,7 @@ class DataModuleFromConfig(pl.LightningDataModule):
         shuffle = shuffle and (not is_iterable_dataset)
 
         return DataLoader(self.datasets["test"], batch_size=self.batch_size,
-                          num_workers=self.num_workers, worker_init_fn=init_fn, shuffle=shuffle, persistent_workers=True)
+                          num_workers=self.num_workers, worker_init_fn=init_fn, shuffle=shuffle, persistent_workers=False, collate_fn=collate_impute_zero)
 
     def _predict_dataloader(self, shuffle=False):
         if isinstance(self.datasets['predict'], Txt2ImgIterableBaseDataset) or self.use_worker_init_fn:
@@ -265,7 +371,7 @@ class DataModuleFromConfig(pl.LightningDataModule):
         else:
             init_fn = None
         return DataLoader(self.datasets["predict"], batch_size=self.batch_size,
-                          num_workers=self.num_workers, worker_init_fn=init_fn, persistent_workers=True)
+                          num_workers=self.num_workers, worker_init_fn=init_fn, persistent_workers=False, collate_fn=collate_impute_zero)
 
 
 class SetupCallback(Callback):
@@ -615,6 +721,10 @@ if __name__ == "__main__":
         trainer_config["gpus"] = 1
         trainer_config["accelerator"] = "gpu"
         trainer_config["progress_bar_refresh_rate"] = 1
+        trainer_config["precision"] = 32 
+        trainer_config["gradient_clip_val"]=1.0
+        trainer_config["gradient_clip_algorithm"]="value"
+        # trainer_config["amp_level"] = "O1"
         for k in nondefault_trainer_args(opt):
             trainer_config[k] = getattr(opt, k)
         # if not "gpus" in trainer_config:
@@ -629,6 +739,79 @@ if __name__ == "__main__":
 
         # model
         model = instantiate_from_config(config.model)
+        #model = model.cuda().half()
+
+        import types
+        # 1) transfer_batch_to_device 훅 정의
+        def transfer_batch_to_device(self, batch, device, dataloader_idx=0):
+            # Lightning 기본 동작으로 GPU로 올리고
+            batch = super(type(self), self).transfer_batch_to_device(batch, device, dataloader_idx)
+            # 모든 Tensor를 half precision으로 변환
+            def to_half(x):
+                return x.half() if isinstance(x, torch.Tensor) else x
+            if isinstance(batch, dict):
+                return {k: to_half(v) for k, v in batch.items()}
+            elif isinstance(batch, (list, tuple)):
+                return type(batch)(to_half(x) for x in batch)
+            else:
+                return to_half(batch)
+
+        # 2) 인스턴스에 바인딩
+        #model.transfer_batch_to_device = types.MethodType(transfer_batch_to_device, model)
+# 
+        # from typing import Tuple
+        # 
+        # class SafeNormMixin:
+        #     def forward(self, x):
+        #         orig_dtype = x.dtype
+        #         x = x.float()
+        #         out = super().forward(x)
+        #         return out.to(orig_dtype)
+# 
+        # # LayerNorm, GroupNorm 클래스 재정의
+        # class SafeLayerNorm(SafeNormMixin, torch.nn.LayerNorm): pass
+        # class SafeGroupNorm(SafeNormMixin, torch.nn.GroupNorm): pass
+# 
+        # def find_parent_module(root: torch.nn.Module, target_name: str) -> Tuple[torch.nn.Module, str]:
+        #     """
+        #     Given a root module and the full dotted name of a submodule (as from named_modules()),
+        #     return (parent_module, attribute_name) so you can setattr on it.
+        #     """
+        #     parts = target_name.split(".")
+        #     assert parts, "Empty name"
+        #     # If top-level, parent is root, attr is full name
+        #     if len(parts) == 1:
+        #         return root, parts[0]
+        #     # Traverse down to the parent of the target
+        #     parent = root
+        #     for p in parts[:-1]:
+        #         parent = getattr(parent, p)
+        #     return parent, parts[-1]
+# 
+        # # 모델 인스턴스화 직후에 패치
+        # for name, module in model.named_modules():
+        #     if isinstance(module, torch.nn.LayerNorm):
+        #         parent, attr = find_parent_module(model, name)
+        #         setattr(parent, attr, SafeLayerNorm(module.normalized_shape, module.eps, module.elementwise_affine))
+        #     if isinstance(module, torch.nn.GroupNorm):
+        #         parent, attr = find_parent_module(model, name)
+        #         setattr(parent, attr, SafeGroupNorm(module.num_groups, module.num_channels, module.eps, module.affine))
+        
+        # 1) CLIP 텍스트 인코더 동결
+        for p in model.cond_stage_model.parameters():
+            p.requires_grad = False
+
+        # 2) VAE first stage 동결
+        for p in model.first_stage_model.parameters():
+            p.requires_grad = False
+
+        # 3) EMA 객체 동결 (사실 gradient를 갖지 않으므로 그냥 놔둬도 무방)
+        for p in model.model_ema.parameters():
+            p.requires_grad = False
+
+        # 4) UNet만 학습
+        for name, p in model.model.diffusion_model.named_parameters():
+            p.requires_grad = True
 
         # trainer and callbacks
         trainer_kwargs = dict()
@@ -712,8 +895,20 @@ if __name__ == "__main__":
             "cuda_callback": {
                 "target": "main.CUDACallback"
             },
-            "progress_bar_custom": {
-                "target": "main.TQDMProgressBarCustom",
+            #"progress_bar_custom": {
+            #    "target": "main.TQDMProgressBarCustom",
+            #    "params": {}
+            #},
+            "dataloader_tqdm": {
+                "target": "main.DataLoaderTqdmCallback",
+                "params": {}
+            },
+            "clear_chace": {
+                "target": "main.ClearCacheCallback",
+                "params": {}
+            },
+            "Nan_check": {
+                "target": "main.NanGuardCallback",
                 "params": {}
             },
         }
