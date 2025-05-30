@@ -6,7 +6,7 @@ from tqdm import tqdm
 def process_masks_per_image(base_seg_dir,
                             output_dir,
                             exts=(".png", ".jpg", ".jpeg"),
-                            threshold=0.3):
+                            threshold=0.41):
     """
     base_seg_dir 아래 여러 서브폴더에 공통으로 들어있는 마스크 파일을 대상으로,
     각 픽셀의 모델별 값(0~255)을 0~1로 정규화한 뒤, 
@@ -65,6 +65,6 @@ def process_masks_per_image(base_seg_dir,
         Image.fromarray(out_arr).save(save_path)
 
 if __name__ == "__main__":
-    seg_root = "C:\\Users\\Seo\\Desktop\\Gits\\ProjectPractice\\DiffV2IR-main_data\\seg_sam2"   # 당신의 seg 폴더 경로
-    output_dir = "C:\\Users\\Seo\\Desktop\\Gits\\ProjectPractice\\DiffV2IR-main\\processed_sam2"
+    seg_root = "seg"   # 당신의 seg 폴더 경로
+    output_dir = "C:\\Users\\Seo\\Desktop\\Gits\\ProjectPractice\\DiffV2IR-main\\processed_yonsei"
     process_masks_per_image(seg_root, output_dir)
